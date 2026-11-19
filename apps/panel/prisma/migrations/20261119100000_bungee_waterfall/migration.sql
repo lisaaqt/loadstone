@@ -1,0 +1,3 @@
+-- AlterEnum
+ALTER TYPE "ServerSoftware" ADD VALUE 'BUNGEECORD';
+ALTER TYPE "ServerSoftware" ADD VALUE 'WATERFALL';

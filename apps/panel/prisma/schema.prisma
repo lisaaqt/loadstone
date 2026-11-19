@@ -1,0 +1,357 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  USER
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  name         String
+  passwordHash String
+  role         Role       @default(USER)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  sessions     Session[]
+  apiTokens    ApiToken[]
+  servers      Server[]
+  activities   Activity[]
+  memberships  ServerMember[]
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+  expiresAt  DateTime
+
+  @@index([userId])
+}
+
+model ApiToken {
+  id         String    @id @default(cuid())
+  name       String
+  prefix     String
+  tokenHash  String    @unique
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+enum NodeStatus {
+  ONLINE
+  OFFLINE
+  UNKNOWN
+}
+
+model Node {
+  id                String       @id @default(cuid())
+  name              String       @unique
+  description       String?
+  scheme            String       @default("http")
+  host              String
+  port              Int          @default(8080)
+  publicHost        String
+  tokenEncrypted    String
+  portRangeStart    Int          @default(25565)
+  portRangeEnd      Int          @default(25665)
+  /// Single ports allowed in addition to the range (e.g. 25565 next to 30000-30100).
+  extraPorts        Int[]        @default([])
+  memoryMb          Int
+  diskMb            Int
+  status            NodeStatus   @default(UNKNOWN)
+  lastSeenAt        DateTime?
+  lastError         String?
+  agentVersion      String?
+  platform          String?
+  cpuModel          String?
+  cpuCount          Int?
+  cpuPercent        Float?
+  memoryTotalBytes  BigInt?
+  memoryUsedBytes   BigInt?
+  diskTotalBytes    BigInt?
+  diskUsedBytes     BigInt?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  servers           Server[]
+  metrics           NodeMetric[]
+  activities        Activity[]
+}
+
+model NodeMetric {
+  id               BigInt   @id @default(autoincrement())
+  nodeId           String
+  node             Node     @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  cpuPercent       Float
+  memoryUsedBytes  BigInt
+  memoryTotalBytes BigInt
+  diskUsedBytes    BigInt
+  diskTotalBytes   BigInt
+  createdAt        DateTime @default(now())
+
+  @@index([nodeId, createdAt])
+}
+
+enum ServerSoftware {
+  VANILLA
+  PAPER
+  PURPUR
+  SPIGOT
+  FABRIC
+  FORGE
+  NEOFORGE
+  QUILT
+  FOLIA
+  VELOCITY
+  BUNGEECORD
+  WATERFALL
+  CUSTOM
+}
+
+enum ServerState {
+  INSTALLING
+  OFFLINE
+  STARTING
+  RUNNING
+  STOPPING
+  ERROR
+  RESTORING
+}
+
+model Server {
+  id              String            @id @default(cuid())
+  name            String
+  description     String?
+  ownerId         String
+  owner           User              @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  nodeId          String
+  node            Node              @relation(fields: [nodeId], references: [id], onDelete: Restrict)
+  software        ServerSoftware
+  mcVersion       String            @default("LATEST")
+  javaVersion     String            @default("21")
+  image           String
+  memoryMb        Int
+  cpuPercent      Int               @default(100)
+  diskMb          Int
+  port            Int
+  internalPort    Int               @default(25565)
+  dataPath        String            @default("/data")
+  env             Json              @default("{}")
+  jvmArgs         String            @default("")
+  startupCommand  String?
+  containerId     String?
+  state           ServerState       @default(INSTALLING)
+  stateChangedAt  DateTime          @default(now())
+  installError    String?
+  backupRetention Int               @default(10)
+  databaseLimit   Int               @default(3)
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  backups         Backup[]
+  schedules       Schedule[]
+  plugins         InstalledPlugin[]
+  activities      Activity[]
+  members         ServerMember[]
+  databases       ServerDatabase[]
+  invites         ServerInvite[]
+
+  @@unique([nodeId, port])
+  @@index([ownerId])
+}
+
+enum DatabaseEngine {
+  MYSQL
+  MARIADB
+  MONGODB
+}
+
+/// External database server (like Pterodactyl database hosts); Loadstone creates databases and users on it.
+model DatabaseHost {
+  id                String           @id @default(cuid())
+  name              String
+  engine            DatabaseEngine
+  host              String
+  port              Int
+  username          String
+  passwordEncrypted String
+  /// Address Minecraft servers use to connect, if different from `host` (e.g. a private IP).
+  connectHost       String?
+  maxDatabases      Int?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  databases         ServerDatabase[]
+}
+
+model ServerDatabase {
+  id                String       @id @default(cuid())
+  serverId          String
+  server            Server       @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  hostId            String
+  host              DatabaseHost @relation(fields: [hostId], references: [id], onDelete: Restrict)
+  name              String
+  username          String
+  passwordEncrypted String
+  /// MySQL/MariaDB host pattern allowed to log in (% = anywhere).
+  remote            String       @default("%")
+  createdAt         DateTime     @default(now())
+
+  @@unique([hostId, name])
+  @@unique([hostId, username])
+  @@index([serverId])
+}
+
+/// A user the owner shared the server with. Members can use everything except members, reinstall and deletion.
+model ServerMember {
+  id        String   @id @default(cuid())
+  serverId  String
+  server    Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([serverId, userId])
+  @@index([userId])
+}
+
+/// Single-use invite link; joining creates (or reuses) an account and adds it as a member.
+model ServerInvite {
+  id          String    @id @default(cuid())
+  serverId    String
+  server      Server    @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  tokenHash   String    @unique
+  createdById String
+  expiresAt   DateTime
+  usedAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([serverId])
+}
+
+enum BackupStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  RESTORING
+}
+
+enum StorageDriver {
+  LOCAL
+  S3
+  SFTP
+}
+
+model Backup {
+  id          String        @id @default(cuid())
+  serverId    String
+  server      Server        @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  name        String
+  status      BackupStatus  @default(PENDING)
+  storage     StorageDriver @default(LOCAL)
+  progress    Int           @default(0)
+  sizeBytes   BigInt?
+  checksum    String?
+  error       String?
+  locked      Boolean       @default(false)
+  ignore      String[]      @default([])
+  scheduled   Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+  completedAt DateTime?
+
+  @@index([serverId, createdAt])
+}
+
+enum ScheduleAction {
+  COMMAND
+  RESTART
+  START
+  STOP
+  BACKUP
+  CLEANUP
+}
+
+model Schedule {
+  id              String         @id @default(cuid())
+  serverId        String
+  server          Server         @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  name            String
+  cron            String
+  timezone        String         @default("UTC")
+  action          ScheduleAction
+  payload         String?
+  enabled         Boolean        @default(true)
+  onlyWhenRunning Boolean        @default(false)
+  lastRunAt       DateTime?
+  lastStatus      String?
+  lastError       String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([serverId])
+}
+
+enum PluginSource {
+  MODRINTH
+  HANGAR
+  UPLOAD
+}
+
+model InstalledPlugin {
+  id          String       @id @default(cuid())
+  serverId    String
+  server      Server       @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  source      PluginSource
+  projectId   String?
+  projectSlug String?
+  name        String
+  versionId   String?
+  versionName String?
+  fileName    String
+  directory   String
+  iconUrl     String?
+  installedAt DateTime     @default(now())
+
+  @@unique([serverId, directory, fileName])
+}
+
+model Activity {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  serverId  String?
+  server    Server?  @relation(fields: [serverId], references: [id], onDelete: SetNull)
+  nodeId    String?
+  node      Node?    @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+  action    String
+  message   String
+  metadata  Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([serverId, createdAt])
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}

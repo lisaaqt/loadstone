@@ -1,0 +1,44 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to …
+        2. Click …
+        3. See error
+  - type: input
+    id: version
+    attributes:
+      label: Loadstone version
+      description: Shown in the panel's account menu (bottom left).
+      placeholder: "0.2.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: setup
+    attributes:
+      label: How do you run Loadstone?
+      options:
+        - Docker Hub images (registry-deploy compose)
+        - All-in-one compose / Portainer / Dockge
+        - Built on the server (update.sh bundle)
+        - Local development
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of `docker compose logs panel worker` and/or `docker logs loadstone-agent`. Remove secrets first.
+      render: text

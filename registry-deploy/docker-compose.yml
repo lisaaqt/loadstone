@@ -1,0 +1,145 @@
+# Loadstone — runs the prebuilt images from the registry (nothing is built on the server).
+#
+#   docker login            # only needed if the Docker Hub repositories are private
+#   cp .env.example .env          # fill it in
+#   docker compose up -d
+#
+# Update to the newest images:  docker compose pull && docker compose up -d
+#
+# Nodes are added in the panel (Nodes → Add node), which shows the agent command to run on each host.
+# Optional parts are enabled with COMPOSE_PROFILES in .env:
+#   db-backup  writes compressed database dumps to ./backups
+
+name: loadstone
+
+x-panel-image: &panel-image ${LOADSTONE_REGISTRY:-lisaaqt}/loadstone-panel:${LOADSTONE_VERSION:-latest}
+
+# Security hardening: no privilege escalation, no Linux capabilities unless listed, read-only root filesystems.
+x-hardened: &hardened
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+# Postgres/Redis entrypoints need these to set up their data folders before dropping to their own user.
+x-db-caps: &db-caps
+  cap_add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"]
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    <<: [*hardened, *db-caps]
+    environment:
+      POSTGRES_USER: loadstone
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: loadstone
+    volumes:
+      # Postgres 18+ keeps its data in /var/lib/postgresql/18/docker inside this volume.
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loadstone"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    <<: [*hardened, *db-caps]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  panel:
+    image: *panel-image
+    restart: unless-stopped
+    <<: *hardened
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/apps/panel/.next/cache:uid=1000,gid=1000
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment: &panel-env
+      DATABASE_URL: postgresql://loadstone:${POSTGRES_PASSWORD}@postgres:5432/loadstone
+      REDIS_URL: redis://redis:6379
+      APP_SECRET: ${APP_SECRET:?Set APP_SECRET in .env (openssl rand -hex 32)}
+      APP_URL: ${APP_URL:?Set APP_URL in .env}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      USER_SERVER_LIMIT: ${USER_SERVER_LIMIT:-0}
+      USER_SERVER_MAX_MEMORY_MB: ${USER_SERVER_MAX_MEMORY_MB:-4096}
+      USER_SERVER_MAX_DISK_MB: ${USER_SERVER_MAX_DISK_MB:-20480}
+      USER_SERVER_MAX_CPU_PERCENT: ${USER_SERVER_MAX_CPU_PERCENT:-200}
+      # Image shown in the "Connect the agent" command when you add a node.
+      AGENT_IMAGE: ${LOADSTONE_REGISTRY:-lisaaqt}/loadstone-agent:${LOADSTONE_VERSION:-latest}
+      # Update check: warns admins when a newer version tag of this image exists in the registry.
+      UPDATE_CHECK: ${UPDATE_CHECK:-true}
+      UPDATE_IMAGE: ${LOADSTONE_REGISTRY:-lisaaqt}/loadstone-panel
+      UPDATE_REGISTRY_USERNAME: ${UPDATE_REGISTRY_USERNAME:-}
+      UPDATE_REGISTRY_PASSWORD: ${UPDATE_REGISTRY_PASSWORD:-}
+      MIGRATE_ON_START: "true"
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  worker:
+    image: ${LOADSTONE_REGISTRY:-lisaaqt}/loadstone-worker:${LOADSTONE_VERSION:-latest}
+    container_name: loadstone-worker
+    restart: unless-stopped
+    <<: *hardened
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      panel: { condition: service_started }
+    environment:
+      <<: *panel-env
+      MIGRATE_ON_START: "false"
+
+  db-backup:
+    profiles: ["db-backup"]
+    image: postgres:18-alpine
+    restart: unless-stopped
+    <<: *hardened
+    read_only: true
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGHOST: postgres
+      PGUSER: loadstone
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: loadstone
+      BACKUP_INTERVAL_SECONDS: ${DB_BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_KEEP: ${DB_BACKUP_KEEP:-7}
+    volumes:
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -o pipefail
+        while true; do
+          file="/backups/loadstone-$$(date +%Y%m%d-%H%M%S).sql.gz"
+          if pg_dump --no-owner | gzip > "$$file.tmp"; then
+            mv "$$file.tmp" "$$file" && echo "backup written: $$file"
+          else
+            rm -f "$$file.tmp"; echo "backup failed" >&2
+          fi
+          ls -1t /backups/loadstone-*.sql.gz 2>/dev/null | tail -n +$$((BACKUP_KEEP + 1)) | xargs -r rm -f
+          sleep "$$BACKUP_INTERVAL_SECONDS"
+        done
+
+volumes:
+  postgres:
+  redis:

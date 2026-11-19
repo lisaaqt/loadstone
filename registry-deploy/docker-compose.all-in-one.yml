@@ -1,0 +1,167 @@
+# Loadstone — everything in one file, no .env needed (works as a Portainer / Dockge stack too).
+#
+# 1. Edit the values in "x-settings" below (generate secrets with: openssl rand -hex 32,
+#    use only letters and digits, no "$").
+# 2. docker login (only if the Docker Hub repositories are private)
+# 3. docker compose -f docker-compose.all-in-one.yml up -d
+# 4. Open APP_URL/setup and create the administrator account.
+#
+# Update to the newest images:
+#   docker compose -f docker-compose.all-in-one.yml pull && docker compose -f docker-compose.all-in-one.yml up -d
+#
+# Starts: postgres, redis, panel, worker, db-backup (daily database dumps to ./backups).
+# Nodes are added in the panel (Nodes → Add node), which shows the agent command to run on each host.
+
+name: loadstone
+
+x-settings:
+  # URL people open in the browser (https:// behind a reverse proxy enables secure cookies).
+  app-url: &app-url "http://YOUR_SERVER_IP:3000"
+  # Host port the panel is published on ("<host port>:3000").
+  app-port: &app-port "3000:3000"
+  # 32+ random characters. Never change it after the first start.
+  app-secret: &app-secret "CHANGE_ME_APP_SECRET_32_CHARS_MINIMUM"
+  # Database password. Put the SAME password into database-url below. Never change it after the first start.
+  postgres-password: &postgres-password "CHANGE_ME_DB_PASSWORD"
+  database-url: &database-url "postgresql://loadstone:CHANGE_ME_DB_PASSWORD@postgres:5432/loadstone"
+  # Set to "true" only behind a reverse proxy that sets X-Forwarded-For.
+  trust-proxy: &trust-proxy "false"
+  # Database dumps: seconds between dumps and how many to keep in ./backups.
+  backup-interval-seconds: &backup-interval-seconds "86400"
+  backup-keep: &backup-keep "7"
+  # Images
+  panel-image: &panel-image lisaaqt/loadstone-panel:latest
+  worker-image: &worker-image lisaaqt/loadstone-worker:latest
+
+x-panel-env: &panel-env
+  DATABASE_URL: *database-url
+  REDIS_URL: redis://redis:6379
+  APP_SECRET: *app-secret
+  APP_URL: *app-url
+  TRUST_PROXY: *trust-proxy
+  ALLOWED_ORIGINS: ""
+  # Servers a normal user may create themselves (0 = only admins), and the caps per self-created server.
+  USER_SERVER_LIMIT: "0"
+  USER_SERVER_MAX_MEMORY_MB: "4096"
+  USER_SERVER_MAX_DISK_MB: "20480"
+  USER_SERVER_MAX_CPU_PERCENT: "200"
+  # Image shown in the "Connect the agent" command when you add a node.
+  AGENT_IMAGE: lisaaqt/loadstone-agent:latest
+  # Update check: warns admins when a newer version tag exists. Add a read-only registry login if the registry needs one.
+  UPDATE_CHECK: "true"
+  UPDATE_IMAGE: lisaaqt/loadstone-panel
+  UPDATE_REGISTRY_USERNAME: ""
+  UPDATE_REGISTRY_PASSWORD: ""
+
+# Security hardening: no privilege escalation, no Linux capabilities unless listed, read-only root filesystems.
+x-hardened: &hardened
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+# Postgres/Redis entrypoints need these to set up their data folders before dropping to their own user.
+x-db-caps: &db-caps
+  cap_add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"]
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    <<: [*hardened, *db-caps]
+    environment:
+      POSTGRES_USER: loadstone
+      POSTGRES_PASSWORD: *postgres-password
+      POSTGRES_DB: loadstone
+    volumes:
+      # Postgres 18+ keeps its data in /var/lib/postgresql/18/docker inside this volume.
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loadstone"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    <<: [*hardened, *db-caps]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  panel:
+    image: *panel-image
+    restart: unless-stopped
+    <<: *hardened
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/apps/panel/.next/cache:uid=1000,gid=1000
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      <<: *panel-env
+      MIGRATE_ON_START: "true"
+    ports:
+      - *app-port
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  worker:
+    image: *worker-image
+    container_name: loadstone-worker
+    restart: unless-stopped
+    <<: *hardened
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      panel: { condition: service_started }
+    environment:
+      <<: *panel-env
+      MIGRATE_ON_START: "false"
+
+  db-backup:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    <<: *hardened
+    read_only: true
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGHOST: postgres
+      PGUSER: loadstone
+      PGPASSWORD: *postgres-password
+      PGDATABASE: loadstone
+      BACKUP_INTERVAL_SECONDS: *backup-interval-seconds
+      BACKUP_KEEP: *backup-keep
+    volumes:
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -o pipefail
+        while true; do
+          file="/backups/loadstone-$$(date +%Y%m%d-%H%M%S).sql.gz"
+          if pg_dump --no-owner | gzip > "$$file.tmp"; then
+            mv "$$file.tmp" "$$file" && echo "backup written: $$file"
+          else
+            rm -f "$$file.tmp"; echo "backup failed" >&2
+          fi
+          ls -1t /backups/loadstone-*.sql.gz 2>/dev/null | tail -n +$$((BACKUP_KEEP + 1)) | xargs -r rm -f
+          sleep "$$BACKUP_INTERVAL_SECONDS"
+        done
+
+volumes:
+  postgres:
+  redis:
